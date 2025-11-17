@@ -283,7 +283,7 @@ function get_min_bids_for_campaign(int $campaignId, array $nmIds, string $paymen
 /**
  * Статистика по кампании /adv/v3/fullstats
  */
-function get_campaign_stats(int $id, int $days = STATS_DAYS): ?array
+function get_campaign_stats(int $id, int $days = STATS_DAYS): array
 {
     $end   = new DateTime('today');
     $start = clone $end;
@@ -295,11 +295,21 @@ function get_campaign_stats(int $id, int $days = STATS_DAYS): ?array
         'endDate'   => $end->format('Y-m-d'),
     ]);
 
-    if (!$resp['ok'] || !is_array($resp['data']) || empty($resp['data'][0])) {
-        return null;
+    if (!$resp['ok']) {
+        return ['_error' => $resp['error'] ?? 'Не удалось получить статистику'];
     }
 
-    $stats = $resp['data'][0];
+    $payload = $resp['data'];
+    // Ответ может приходить как массив либо как {"data": [...]}
+    if (isset($payload['data']) && is_array($payload['data'])) {
+        $payload = $payload['data'];
+    }
+
+    if (!is_array($payload) || empty($payload[0])) {
+        return ['_error' => 'Статистика не найдена в ответе API'];
+    }
+
+    $stats = $payload[0];
     $stats['_beginDate'] = $start->format('Y-m-d');
     $stats['_endDate']   = $end->format('Y-m-d');
     return $stats;
@@ -355,32 +365,23 @@ function stop_campaign(int $id): array
 }
 
 /**
- * Переключить placement (search / recommendations) через /adv/v0/auction/placements
- * Только для кампаний типа 9.
+ * Установить зоны показов (поиск/рекомендации) через /adv/v0/auction/placements.
+ * Принимает желаемое состояние, чтобы можно было включать обе зоны одновременно.
  */
-function toggle_placement(int $campaignId, string $placementKey): array
+function update_placements(int $campaignId, bool $search, bool $recommendations): array
 {
     $campaign = get_campaign_by_id($campaignId);
     if (!$campaign) {
         return [false, 'Кампания не найдена или не является типом 9'];
     }
 
-    $placements = $campaign['placements'] ?? ['search' => false, 'recommendations' => false];
-
-    if (!array_key_exists($placementKey, $placements)) {
-        return [false, 'Неизвестная зона показа: ' . htmlspecialchars($placementKey)];
-    }
-
-    // Переключаем выбранный placement
-    $placements[$placementKey] = !$placements[$placementKey];
-
     $body = [
         'placements' => [
             [
                 'advert_id'  => $campaignId,
                 'placements' => [
-                    'search'          => (bool)$placements['search'],
-                    'recommendations' => (bool)$placements['recommendations'],
+                    'search'          => $search,
+                    'recommendations' => $recommendations,
                 ],
             ],
         ],
@@ -391,6 +392,155 @@ function toggle_placement(int $campaignId, string $placementKey): array
         return [true, 'Зоны показов обновлены'];
     }
     return [false, 'Ошибка смены зон показов: ' . $resp['error']];
+}
+
+/**
+ * Получить ставки по поисковым кластерам.
+ */
+function get_normquery_bids(array $items): array
+{
+    if (empty($items)) return [];
+
+    $resp = wb_request('POST', '/adv/v0/normquery/get-bids', [], ['items' => $items]);
+    if (!$resp['ok'] || !isset($resp['data']['bids']) || !is_array($resp['data']['bids'])) {
+        return [];
+    }
+    return $resp['data']['bids'];
+}
+
+/**
+ * Получить статистику по кластерам за период.
+ */
+function get_normquery_stats_range(string $from, string $to, array $items): array
+{
+    if (empty($items)) return [];
+
+    $resp = wb_request('POST', '/adv/v0/normquery/stats', [], [
+        'from'  => $from,
+        'to'    => $to,
+        'items' => $items,
+    ]);
+
+    if (!$resp['ok'] || !isset($resp['data']['stats']) || !is_array($resp['data']['stats'])) {
+        return [];
+    }
+
+    return $resp['data']['stats'];
+}
+
+/**
+ * Получить минус-фразы по кластерам.
+ */
+function get_normquery_minus(array $items): array
+{
+    if (empty($items)) return [];
+
+    $resp = wb_request('POST', '/adv/v0/normquery/get-minus', [], ['items' => $items]);
+    if (!$resp['ok'] || !isset($resp['data']['items']) || !is_array($resp['data']['items'])) {
+        return [];
+    }
+
+    return $resp['data']['items'];
+}
+
+/**
+ * Установить ставки по кластерам (массово).
+ */
+function set_normquery_bids(array $bids): array
+{
+    if (empty($bids)) return [false, 'Нет ставок для обновления'];
+    $resp = wb_request('POST', '/adv/v0/normquery/bids', [], ['bids' => $bids]);
+    return [$resp['ok'], $resp['error'] ?? null];
+}
+
+/**
+ * Удалить ставки по кластерам (массово).
+ */
+function delete_normquery_bids(array $bids): array
+{
+    if (empty($bids)) return [false, 'Нет ставок для удаления'];
+    $resp = wb_request('DELETE', '/adv/v0/normquery/bids', [], ['bids' => $bids]);
+    return [$resp['ok'], $resp['error'] ?? null];
+}
+
+/**
+ * Установить/удалить минус-фразы для кампании+артикула.
+ */
+function set_normquery_minus(int $advertId, int $nmId, array $phrases): array
+{
+    $resp = wb_request('POST', '/adv/v0/normquery/set-minus', [], [
+        'advert_id'   => $advertId,
+        'nm_id'       => $nmId,
+        'norm_queries'=> array_values($phrases),
+    ]);
+
+    return [$resp['ok'], $resp['error'] ?? null];
+}
+
+/**
+ * Собрать данные по поисковым кластерам: ставки, статистика, минус-фразы.
+ */
+function build_clusters_dataset(int $campaignId, array $nmIds, string $from, string $to): array
+{
+    $items = [];
+    foreach ($nmIds as $nmId) {
+        $items[] = [
+            'advert_id' => $campaignId,
+            'nm_id'     => $nmId,
+        ];
+    }
+
+    $bidsRaw   = get_normquery_bids($items);
+    $statsRaw  = get_normquery_stats_range($from, $to, $items);
+    $minusRaw  = get_normquery_minus($items);
+
+    $clusters = [];
+
+    foreach ($bidsRaw as $b) {
+        $norm = $b['norm_query'] ?? '';
+        $nmId = $b['nm_id'] ?? null;
+        if ($norm === '' || $nmId === null) continue;
+        $key = $nmId . '::' . $norm;
+        $clusters[$key] = [
+            'nm_id'      => (int)$nmId,
+            'advert_id'  => (int)($b['advert_id'] ?? $campaignId),
+            'norm_query' => $norm,
+            'bid'        => (int)($b['bid'] ?? 0),
+            'stats'      => [],
+        ];
+    }
+
+    foreach ($statsRaw as $row) {
+        $nmId = $row['nm_id'] ?? null;
+        if ($nmId === null || empty($row['stats']) || !is_array($row['stats'])) continue;
+        foreach ($row['stats'] as $stat) {
+            $norm = $stat['norm_query'] ?? ($stat['query'] ?? null);
+            if ($norm === null) continue;
+            $key = $nmId . '::' . $norm;
+            if (!isset($clusters[$key])) {
+                $clusters[$key] = [
+                    'nm_id'      => (int)$nmId,
+                    'advert_id'  => (int)($row['advert_id'] ?? $campaignId),
+                    'norm_query' => $norm,
+                    'bid'        => null,
+                    'stats'      => [],
+                ];
+            }
+            $clusters[$key]['stats'] = $stat;
+        }
+    }
+
+    $minus = [];
+    foreach ($minusRaw as $item) {
+        $nmId = $item['nm_id'] ?? null;
+        if ($nmId === null) continue;
+        $minus[$nmId] = $item['norm_queries'] ?? [];
+    }
+
+    return [
+        'clusters' => $clusters,
+        'minus'    => $minus,
+    ];
 }
 
 /**
@@ -445,9 +595,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($ok) $flashMessage = $msg; else $flashError = $msg;
             break;
 
-        case 'toggle_placement':
-            $placement = $_POST['placement'] ?? '';
-            list($ok, $msg) = toggle_placement($campaignId, $placement);
+        case 'update_placements':
+            $searchState = !empty($_POST['search_state']);
+            $recState    = !empty($_POST['recommendations_state']);
+            list($ok, $msg) = update_placements($campaignId, $searchState, $recState);
             if ($ok) $flashMessage = $msg; else $flashError = $msg;
             break;
 
@@ -457,6 +608,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $newBid   = isset($_POST['new_bid']) ? (int)$_POST['new_bid'] : 0;
             list($ok, $msg) = update_bid($campaignId, $nmId, $placement, $newBid);
             if ($ok) $flashMessage = $msg; else $flashError = $msg;
+            break;
+
+        case 'update_cluster_bid':
+            $nmId   = isset($_POST['nm_id']) ? (int)$_POST['nm_id'] : 0;
+            $norm   = $_POST['norm_query'] ?? '';
+            $newBid = isset($_POST['new_bid']) ? (int)$_POST['new_bid'] : 0;
+            $payload = [
+                [
+                    'advert_id'  => $campaignId,
+                    'nm_id'      => $nmId,
+                    'norm_query' => $norm,
+                    'bid'        => max(400, min(1500, $newBid)),
+                ],
+            ];
+            list($ok, $msg) = set_normquery_bids($payload);
+            if ($ok) $flashMessage = 'Ставка по кластеру обновлена'; else $flashError = $msg;
+            break;
+
+        case 'delete_cluster_bid':
+        case 'reset_cluster_bid':
+            $nmId = isset($_POST['nm_id']) ? (int)$_POST['nm_id'] : 0;
+            $norm = $_POST['norm_query'] ?? '';
+            $payload = [
+                [
+                    'advert_id'  => $campaignId,
+                    'nm_id'      => $nmId,
+                    'norm_query' => $norm,
+                    'bid'        => 0,
+                ],
+            ];
+            list($ok, $msg) = delete_normquery_bids($payload);
+            if ($ok) {
+                $flashMessage = $formAction === 'reset_cluster_bid' ? 'Ставка возвращена к базовой' : 'Кластер отключён';
+            } else {
+                $flashError = $msg;
+            }
+            break;
+
+        case 'update_minus_phrases':
+            $nmId   = isset($_POST['nm_id']) ? (int)$_POST['nm_id'] : 0;
+            $raw    = $_POST['minus_phrases'] ?? '';
+            $phrases = array_filter(array_map('trim', preg_split('/\r?\n/', $raw)));
+            list($ok, $msg) = set_normquery_minus($campaignId, $nmId, $phrases);
+            if ($ok) $flashMessage = 'Минус-фразы обновлены'; else $flashError = $msg;
             break;
     }
 }
@@ -746,6 +941,57 @@ $currentId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
             transform: translateX(18px);
         }
 
+        .clusters-header {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .clusters-tools {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .clusters-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .clusters-table th,
+        .clusters-table td {
+            padding: 8px 6px;
+            border-bottom: 1px solid #40444b;
+            font-size: 13px;
+        }
+
+        .clusters-table th {
+            color: var(--text-muted);
+            text-align: left;
+            font-weight: 500;
+        }
+
+        .pill-input {
+            background: var(--bg-card-soft);
+            border: 1px solid var(--border-soft);
+            border-radius: 8px;
+            padding: 6px 10px;
+            color: var(--text-main);
+        }
+
+        .cluster-actions {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .muted-small {
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
         @media (max-width: 900px) {
             .grid-2 {
                 grid-template-columns: minmax(0, 1fr);
@@ -806,6 +1052,17 @@ $currentId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
             $minBids = get_min_bids_for_campaign($currentId, $nmIds, $paymentType);
 
             $stats = get_campaign_stats($currentId, STATS_DAYS);
+            $statsError = $stats['_error'] ?? null;
+            if ($statsError) {
+                $stats = null;
+            }
+            
+            $clusterFrom = $_GET['cluster_from'] ?? (new DateTime('-6 days'))->format('Y-m-d');
+            $clusterTo   = $_GET['cluster_to']   ?? (new DateTime('today'))->format('Y-m-d');
+            $clusterDataset = build_clusters_dataset($currentId, $nmIds, $clusterFrom, $clusterTo);
+            $clusters = $clusterDataset['clusters'];
+            ksort($clusters);
+            $minusMap = $clusterDataset['minus'];
         ?>
 
         <div class="card">
@@ -868,35 +1125,30 @@ $currentId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
                 <div class="flex-space">
                     <div><strong>Зоны показов</strong></div>
                 </div>
-                <div class="mt-12">
+                <form method="post" id="placements-form" class="mt-12">
+                    <input type="hidden" name="action" value="update_placements">
+                    <input type="hidden" name="campaign_id" value="<?= htmlspecialchars($currentId) ?>">
+                    <input type="hidden" name="search_state" id="placements-search-state" value="<?= !empty($placements['search']) ? 1 : 0 ?>">
+                    <input type="hidden" name="recommendations_state" id="placements-rec-state" value="<?= !empty($placements['recommendations']) ? 1 : 0 ?>">
+
                     <div class="flex-space">
                         <span>Поиск</span>
-                        <form method="post">
-                            <input type="hidden" name="action" value="toggle_placement">
-                            <input type="hidden" name="campaign_id" value="<?= htmlspecialchars($currentId) ?>">
-                            <input type="hidden" name="placement" value="search">
-                            <label class="switch">
-                                <input type="checkbox" <?= !empty($placements['search']) ? 'checked' : '' ?> onchange="this.form.submit()">
-                                <span class="slider"></span>
-                            </label>
-                        </form>
+                        <label class="switch">
+                            <input type="checkbox" id="placement-search" <?= !empty($placements['search']) ? 'checked' : '' ?> onchange="syncPlacementsAndSubmit()">
+                            <span class="slider"></span>
+                        </label>
                     </div>
                     <div class="flex-space mt-8">
                         <span>Рекомендации</span>
-                        <form method="post">
-                            <input type="hidden" name="action" value="toggle_placement">
-                            <input type="hidden" name="campaign_id" value="<?= htmlspecialchars($currentId) ?>">
-                            <input type="hidden" name="placement" value="recommendations">
-                            <label class="switch">
-                                <input type="checkbox" <?= !empty($placements['recommendations']) ? 'checked' : '' ?> onchange="this.form.submit()">
-                                <span class="slider"></span>
-                            </label>
-                        </form>
+                        <label class="switch">
+                            <input type="checkbox" id="placement-recommendations" <?= !empty($placements['recommendations']) ? 'checked' : '' ?> onchange="syncPlacementsAndSubmit()">
+                            <span class="slider"></span>
+                        </label>
                     </div>
                     <div class="mt-12 muted">
-                        Если ползунок справа — зона включена, слева — выключена.
+                        Зоны теперь устанавливаются явно — можно включать поиск и рекомендации одновременно.
                     </div>
-                </div>
+                </form>
             </div>
 
             <!-- КРАТКАЯ ИНФА -->
@@ -908,6 +1160,164 @@ $currentId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
                     <div>Тип ставки: <span class="muted"><?= htmlspecialchars($bidType) ?></span></div>
                     <div>Всего товаров в кампании: <span class="muted"><?= count($nmSettings) ?></span></div>
                 </div>
+            </div>
+        </div>
+
+        <!-- ТОП ПОИСКОВЫХ КЛАСТЕРОВ -->
+        <div class="card mt-16">
+            <div class="clusters-header">
+                <div>
+                    <div class="title" style="font-size: 18px;">Топ поисковых кластеров</div>
+                    <div class="muted-small">Отображаются включённые и выключенные кластеры. Можно редактировать ставку CRM (400–1500).</div>
+                </div>
+                <div class="clusters-tools">
+                    <input type="text" id="cluster-filter" class="pill-input" placeholder="Искать кластер...">
+                    <form method="get" class="clusters-tools">
+                        <input type="hidden" name="view" value="campaign">
+                        <input type="hidden" name="id" value="<?= htmlspecialchars($currentId) ?>">
+                        <input type="date" name="cluster_from" value="<?= htmlspecialchars($clusterFrom) ?>" class="pill-input">
+                        <input type="date" name="cluster_to" value="<?= htmlspecialchars($clusterTo) ?>" class="pill-input">
+                        <button class="btn" type="submit">Обновить период</button>
+                    </form>
+                </div>
+            </div>
+
+            <?php if (empty($clusters)): ?>
+                <div class="mt-12 muted">Кластеры не найдены для указанных артикулов.</div>
+            <?php else: ?>
+                <div class="mt-12" style="overflow-x:auto;">
+                    <table class="clusters-table" id="clusters-table">
+                        <thead>
+                        <tr>
+                            <th>Кластер</th>
+                            <th>Ставка CRM</th>
+                            <th>Средняя позиция</th>
+                            <th>Показы</th>
+                            <th>Клики</th>
+                            <th>Корзина</th>
+                            <th>Заказы</th>
+                            <th>Управление кластерами</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <?php
+                        $sumShows = $sumClicks = $sumCart = $sumOrders = 0;
+                        $avgPosValues = [];
+                        foreach ($clusters as $c) {
+                            $stat = $c['stats'] ?? [];
+                            if (isset($stat['shows']) || isset($stat['views'])) {
+                                $sumShows += (int)($stat['shows'] ?? $stat['views'] ?? 0);
+                            }
+                            if (isset($stat['clicks'])) {
+                                $sumClicks += (int)$stat['clicks'];
+                            }
+                            if (isset($stat['cart']) || isset($stat['baskets'])) {
+                                $sumCart += (int)($stat['cart'] ?? $stat['baskets'] ?? 0);
+                            }
+                            if (isset($stat['orders'])) {
+                                $sumOrders += (int)$stat['orders'];
+                            }
+                            if (isset($stat['avg_position']) || isset($stat['avgPosition'])) {
+                                $avgPosValues[] = (float)($stat['avg_position'] ?? $stat['avgPosition']);
+                            }
+                        }
+                        $avgPosTotal = count($avgPosValues) ? array_sum($avgPosValues) / count($avgPosValues) : null;
+                        ?>
+                        <tr class="muted" style="font-weight: 600;">
+                            <td>Всего по топ кластерам</td>
+                            <td>—</td>
+                            <td><?= $avgPosTotal !== null ? number_format($avgPosTotal, 2, ',', ' ') : 'н/д' ?></td>
+                            <td><?= number_format($sumShows, 0, ',', ' ') ?></td>
+                            <td><?= number_format($sumClicks, 0, ',', ' ') ?></td>
+                            <td><?= number_format($sumCart, 0, ',', ' ') ?></td>
+                            <td><?= number_format($sumOrders, 0, ',', ' ') ?></td>
+                            <td><span class="muted-small">Агрегированные значения</span></td>
+                        </tr>
+                        <?php foreach ($clusters as $c): ?>
+                            <?php
+                            $stat = $c['stats'] ?? [];
+                            $avgPos = $stat['avg_position'] ?? ($stat['avgPosition'] ?? 'н/д');
+                            $shows  = $stat['shows'] ?? ($stat['views'] ?? 'н/д');
+                            $clicks = $stat['clicks'] ?? 'н/д';
+                            $cart   = $stat['cart'] ?? ($stat['baskets'] ?? 'н/д');
+                            $orders = $stat['orders'] ?? 'н/д';
+                            ?>
+                            <tr data-cluster="<?= htmlspecialchars(mb_strtolower($c['norm_query'])) ?>">
+                                <td>
+                                    <div><strong><?= htmlspecialchars($c['norm_query']) ?></strong></div>
+                                    <div class="muted-small">Артикул: <?= htmlspecialchars($c['nm_id']) ?></div>
+                                </td>
+                                <td>
+                                    <form method="post" class="cluster-actions">
+                                        <input type="hidden" name="action" value="update_cluster_bid">
+                                        <input type="hidden" name="campaign_id" value="<?= htmlspecialchars($currentId) ?>">
+                                        <input type="hidden" name="nm_id" value="<?= htmlspecialchars($c['nm_id']) ?>">
+                                        <input type="hidden" name="norm_query" value="<?= htmlspecialchars($c['norm_query']) ?>">
+                                        <input type="number" name="new_bid" min="400" max="1500" class="input" value="<?= htmlspecialchars($c['bid'] ?? 400) ?>">
+                                        <button class="btn" type="submit">Сохранить</button>
+                                    </form>
+                                </td>
+                                <td><?= htmlspecialchars($avgPos) ?></td>
+                                <td><?= htmlspecialchars($shows) ?></td>
+                                <td><?= htmlspecialchars($clicks) ?></td>
+                                <td><?= htmlspecialchars($cart) ?></td>
+                                <td><?= htmlspecialchars($orders) ?></td>
+                                <td>
+                                    <div class="cluster-actions">
+                                        <form method="post">
+                                            <input type="hidden" name="action" value="delete_cluster_bid">
+                                            <input type="hidden" name="campaign_id" value="<?= htmlspecialchars($currentId) ?>">
+                                            <input type="hidden" name="nm_id" value="<?= htmlspecialchars($c['nm_id']) ?>">
+                                            <input type="hidden" name="norm_query" value="<?= htmlspecialchars($c['norm_query']) ?>">
+                                            <button class="btn btn-outline" type="submit">Отключить</button>
+                                        </form>
+                                        <form method="post">
+                                            <input type="hidden" name="action" value="update_cluster_bid">
+                                            <input type="hidden" name="campaign_id" value="<?= htmlspecialchars($currentId) ?>">
+                                            <input type="hidden" name="nm_id" value="<?= htmlspecialchars($c['nm_id']) ?>">
+                                            <input type="hidden" name="norm_query" value="<?= htmlspecialchars($c['norm_query']) ?>">
+                                            <input type="hidden" name="new_bid" value="<?= htmlspecialchars(max(400, (int)($c['bid'] ?? 400))) ?>">
+                                            <button class="btn btn-success" type="submit">Включить</button>
+                                        </form>
+                                        <form method="post">
+                                            <input type="hidden" name="action" value="reset_cluster_bid">
+                                            <input type="hidden" name="campaign_id" value="<?= htmlspecialchars($currentId) ?>">
+                                            <input type="hidden" name="nm_id" value="<?= htmlspecialchars($c['nm_id']) ?>">
+                                            <input type="hidden" name="norm_query" value="<?= htmlspecialchars($c['norm_query']) ?>">
+                                            <button class="btn btn-outline" type="submit">Вернуть базовую ставку</button>
+                                        </form>
+                                    </div>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            <?php endif; ?>
+        </div>
+
+        <!-- МИНУС-ФРАЗЫ -->
+        <div class="card">
+            <div class="title" style="font-size: 18px;">Минус-фразы по артикулам</div>
+            <div class="muted-small">Каждый блок ниже соответствует артикулу. Пустой список удалит все минус-фразы.</div>
+            <div class="grid-2 mt-12">
+                <?php foreach ($nmIds as $nmId): ?>
+                    <div class="card" style="background: var(--bg-card-soft);">
+                        <form method="post">
+                            <div class="flex-space">
+                                <strong>Артикул <?= htmlspecialchars($nmId) ?></strong>
+                                <div>
+                                    <input type="hidden" name="action" value="update_minus_phrases">
+                                    <input type="hidden" name="campaign_id" value="<?= htmlspecialchars($currentId) ?>">
+                                    <input type="hidden" name="nm_id" value="<?= htmlspecialchars($nmId) ?>">
+                                    <button class="btn btn-outline" type="submit">Сохранить</button>
+                                </div>
+                            </div>
+                            <textarea name="minus_phrases" rows="6" style="width:100%; margin-top:8px; border-radius:8px; border:1px solid var(--border-soft); background: var(--bg-card); color: var(--text-main); padding:8px;">
+<?= htmlspecialchars(implode("\n", $minusMap[$nmId] ?? [])) ?></textarea>
+                        </form>
+                    </div>
+                <?php endforeach; ?>
             </div>
         </div>
 
@@ -1000,7 +1410,11 @@ $currentId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
                 <?php endif; ?>
             </div>
 
-            <?php if (!$stats): ?>
+            <?php if (!empty($statsError)): ?>
+                <div class="mt-12 muted">
+                    Статистика не загружена: <?= htmlspecialchars($statsError) ?>
+                </div>
+            <?php elseif (!$stats): ?>
                 <div class="mt-12 muted">
                     Статистика не найдена (либо нет данных за период, либо кампания не в статусах 7/9/11).
                 </div>
@@ -1185,10 +1599,33 @@ $currentId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
     <?php endif; ?>
 
     <div class="mt-16 muted">
-        Поднятие сервера: <code>php -S localhost:8080</code> из папки проекта.  
+        Поднятие сервера: <code>php -S localhost:8080</code> из папки проекта.
         Если вдруг начнут сыпаться 401 — сначала проверь, что токен для категории <strong>Продвижение</strong> верный и не истёк.
     </div>
 
 </div>
+
+<script>
+    function syncPlacementsAndSubmit() {
+        const form = document.getElementById('placements-form');
+        if (!form) return;
+        const search = document.getElementById('placement-search');
+        const rec = document.getElementById('placement-recommendations');
+        document.getElementById('placements-search-state').value = search && search.checked ? 1 : 0;
+        document.getElementById('placements-rec-state').value = rec && rec.checked ? 1 : 0;
+        form.submit();
+    }
+
+    const clusterFilter = document.getElementById('cluster-filter');
+    if (clusterFilter) {
+        clusterFilter.addEventListener('input', () => {
+            const term = clusterFilter.value.trim().toLowerCase();
+            document.querySelectorAll('#clusters-table tbody tr').forEach(row => {
+                const text = row.getAttribute('data-cluster') || '';
+                row.style.display = text.includes(term) ? '' : 'none';
+            });
+        });
+    }
+</script>
 </body>
 </html>
