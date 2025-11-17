@@ -283,7 +283,7 @@ function get_min_bids_for_campaign(int $campaignId, array $nmIds, string $paymen
 /**
  * Статистика по кампании /adv/v3/fullstats
  */
-function get_campaign_stats(int $id, int $days = STATS_DAYS): ?array
+function get_campaign_stats(int $id, int $days = STATS_DAYS): array
 {
     $end   = new DateTime('today');
     $start = clone $end;
@@ -295,11 +295,21 @@ function get_campaign_stats(int $id, int $days = STATS_DAYS): ?array
         'endDate'   => $end->format('Y-m-d'),
     ]);
 
-    if (!$resp['ok'] || !is_array($resp['data']) || empty($resp['data'][0])) {
-        return null;
+    if (!$resp['ok']) {
+        return ['_error' => $resp['error'] ?? 'Не удалось получить статистику'];
     }
 
-    $stats = $resp['data'][0];
+    $payload = $resp['data'];
+    // Ответ может приходить как массив либо как {"data": [...]}
+    if (isset($payload['data']) && is_array($payload['data'])) {
+        $payload = $payload['data'];
+    }
+
+    if (!is_array($payload) || empty($payload[0])) {
+        return ['_error' => 'Статистика не найдена в ответе API'];
+    }
+
+    $stats = $payload[0];
     $stats['_beginDate'] = $start->format('Y-m-d');
     $stats['_endDate']   = $end->format('Y-m-d');
     return $stats;
@@ -1042,7 +1052,11 @@ $currentId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
             $minBids = get_min_bids_for_campaign($currentId, $nmIds, $paymentType);
 
             $stats = get_campaign_stats($currentId, STATS_DAYS);
-
+            $statsError = $stats['_error'] ?? null;
+            if ($statsError) {
+                $stats = null;
+            }
+            
             $clusterFrom = $_GET['cluster_from'] ?? (new DateTime('-6 days'))->format('Y-m-d');
             $clusterTo   = $_GET['cluster_to']   ?? (new DateTime('today'))->format('Y-m-d');
             $clusterDataset = build_clusters_dataset($currentId, $nmIds, $clusterFrom, $clusterTo);
@@ -1186,6 +1200,39 @@ $currentId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
                         </tr>
                         </thead>
                         <tbody>
+                        <?php
+                        $sumShows = $sumClicks = $sumCart = $sumOrders = 0;
+                        $avgPosValues = [];
+                        foreach ($clusters as $c) {
+                            $stat = $c['stats'] ?? [];
+                            if (isset($stat['shows']) || isset($stat['views'])) {
+                                $sumShows += (int)($stat['shows'] ?? $stat['views'] ?? 0);
+                            }
+                            if (isset($stat['clicks'])) {
+                                $sumClicks += (int)$stat['clicks'];
+                            }
+                            if (isset($stat['cart']) || isset($stat['baskets'])) {
+                                $sumCart += (int)($stat['cart'] ?? $stat['baskets'] ?? 0);
+                            }
+                            if (isset($stat['orders'])) {
+                                $sumOrders += (int)$stat['orders'];
+                            }
+                            if (isset($stat['avg_position']) || isset($stat['avgPosition'])) {
+                                $avgPosValues[] = (float)($stat['avg_position'] ?? $stat['avgPosition']);
+                            }
+                        }
+                        $avgPosTotal = count($avgPosValues) ? array_sum($avgPosValues) / count($avgPosValues) : null;
+                        ?>
+                        <tr class="muted" style="font-weight: 600;">
+                            <td>Всего по топ кластерам</td>
+                            <td>—</td>
+                            <td><?= $avgPosTotal !== null ? number_format($avgPosTotal, 2, ',', ' ') : 'н/д' ?></td>
+                            <td><?= number_format($sumShows, 0, ',', ' ') ?></td>
+                            <td><?= number_format($sumClicks, 0, ',', ' ') ?></td>
+                            <td><?= number_format($sumCart, 0, ',', ' ') ?></td>
+                            <td><?= number_format($sumOrders, 0, ',', ' ') ?></td>
+                            <td><span class="muted-small">Агрегированные значения</span></td>
+                        </tr>
                         <?php foreach ($clusters as $c): ?>
                             <?php
                             $stat = $c['stats'] ?? [];
@@ -1363,7 +1410,11 @@ $currentId = isset($_GET['id']) ? (int)$_GET['id'] : 0;
                 <?php endif; ?>
             </div>
 
-            <?php if (!$stats): ?>
+            <?php if (!empty($statsError)): ?>
+                <div class="mt-12 muted">
+                    Статистика не загружена: <?= htmlspecialchars($statsError) ?>
+                </div>
+            <?php elseif (!$stats): ?>
                 <div class="mt-12 muted">
                     Статистика не найдена (либо нет данных за период, либо кампания не в статусах 7/9/11).
                 </div>
